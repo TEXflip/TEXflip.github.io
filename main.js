@@ -1,104 +1,238 @@
-var canvas = document.getElementById('canvas');
-var gl = canvas.getContext('webgl2');
-twgl.setDefaults({attribPrefix: "a_"});
-numVerts = 1000;
-const arrays = {
-	position: [-1, -1, 0, 1, -1, 0, -1, 1, 0, -1, 1, 0, 1, -1, 0, 1, 1, 0],
-};
+/*
+    This is an example of a very basic particle system
+    using transform feedback. 
 
-let vertexShader = `
-	#version 300 es
+    It's important to remember that not all particle
+    systems *need* transform feedback. It's just a tool
+    you can use when the number of particles grow very
+    large. This animation could have been done entirely
+    in JavaScript, but you would run out of CPU capcity
+    and saturate your bandwidth on most hardware.
+*/
 
-	out vec3 a_position;
-	out vec3 a_velocity;
+const vertexShaderSource = `#version 300 es
+#pragma vscode_glsllint_stage: vert
 
-	void main() {
-		a_position = a_position + a_velocity;
-		a_velocity = vec3(0.1, 0.1, 0.);
+uniform float uRandom;
+
+layout(location=0) in float aAge;
+layout(location=1) in float aLifespan;
+layout(location=2) in vec2 aPosition;
+layout(location=3) in vec2 aVelocity;
+
+out float vAge;
+out float vLifespan;
+out vec2 vPosition;
+out vec2 vVelocity;
+out float vHealth;
+
+/* From TheBookOfShaders, chapter 10. This is a slightly upscaled implementation
+ of the algorithm:
+    r = Math.cos(aReallyHugeNumber);
+ except it attempts to avoid the concentration of values around 1 and 0 by 
+ multiplying by a very large irrational number and then discarding the result's
+ integer component. Acceptable results. Other deterministic pseudo-random number 
+ algorithms are available (including random textures).
+*/
+float rand2(vec2 source)
+{
+    return fract(sin(dot(source.xy, vec2(1.9898,1.2313))) * 42758.5453123);
+} 
+
+void main()
+{
+	// Note that even values you **arn't** updating
+	// must be assigned to the varying or else the 
+	// value will be 0 in the next draw call.
+	vec2 gravity = vec2(0.0, 0.0);
+
+	vVelocity = aVelocity;
+	vPosition = aPosition + vVelocity;
+	vAge = min(aLifespan, aAge + .05);
+	vLifespan = aLifespan;
+
+	if (vPosition.y < -1.0) {
+		vPosition.y = 1.0;
 	}
-`;
-
-let fragmentShader = `
-	#version 300 es
-	precision mediump float;
-	out vec4 o;
-	void main() {
-		o = vec4(0);
+	if (vPosition.y > 1.0) {
+		vPosition.y = -1.0;
 	}
-`;
+	if (vPosition.x < -1.0) {
+		vPosition.x = 1.0;
+	}
+	if (vPosition.x > 1.0) {
+		vPosition.x = -1.0;
+	}
 
+    vHealth = 1.0 - (vAge / vLifespan);
+    
+    gl_Position = vec4(vPosition, 0.0, 1.0);
+    gl_PointSize = 4.0;
+}`;
 
-// twgl setup with shaders
-const feedbackProgramInfo = twgl.createProgramInfo(gl, [vertexShader, fragmentShader],
-{ transformFeedbackVaryings: [
-	"a_position",
-	"a_velocity",
-  ],
-});
+const fragmentShaderSource = `#version 300 es
+#pragma vscode_glsllint_stage: frag
 
-function generateMesh(tf, bufferInfo) {
-    // Generate a mesh using transform feedback
+precision mediump float;
 
-    gl.enable(gl.RASTERIZER_DISCARD);
+in float vHealth;
 
-    gl.useProgram(feedbackProgramInfo.program);
-    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
-    gl.beginTransformFeedback(gl.POINTS);
-    twgl.drawBufferInfo(gl, bufferInfo);
-    gl.endTransformFeedback();
-    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+out vec4 fragColor;
 
-    gl.disable(gl.RASTERIZER_DISCARD);
+void main()
+{
+    // Point primitives are considered to have a width and
+    // height of 1 and the center is at (.5, .5). So if we
+    // discard fragments beyond this distance, we get a
+    // point primitive shaped like a disc.
+
+    float distanceFromPointCenter = distance(gl_PointCoord.xy, vec2(0.5));
+    if (distanceFromPointCenter > 0.5) discard;
+
+    fragColor = vec4(1., 1., 0., 1.);
+}`;
+
+const canvas = document.querySelector('canvas');
+const gl = canvas.getContext('webgl2');
+const program = gl.createProgram();
+
+const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vertexShader, vertexShaderSource);
+gl.compileShader(vertexShader);
+gl.attachShader(program, vertexShader);
+
+const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fragmentShader, fragmentShaderSource);
+gl.compileShader(fragmentShader);
+gl.attachShader(program, fragmentShader);
+
+// This line tells WebGL that these four output varyings should
+// be recorded by transform feedback and that we're using a single
+// buffer to record them.
+gl.transformFeedbackVaryings(program, ['vAge', 'vLifespan', 'vPosition', 'vVelocity'], gl.INTERLEAVED_ATTRIBS);
+
+gl.linkProgram(program);
+
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.log(gl.getShaderInfoLog(vertexShader));
+    console.log(gl.getShaderInfoLog(fragmentShader));
+    console.log(gl.getProgramInfoLog(program));
 }
 
-const bufferInfo = twgl.createBufferInfoFromArrays(gl, {
-	position: numVerts * 3,
-	velocity: numVerts * 3,
-});
+gl.useProgram(program);
 
-const tf = twgl.createTransformFeedback(gl, feedbackProgramInfo, bufferInfo);
-generateMesh(tf, bufferInfo);
+// This is the number of primitives we will draw
+const COUNT = 100;
 
-// render on framebugffer
-const attachments = [
-	{ format: twgl.RGBA, type: twgl.UNSIGNED_BYTE, min: twgl.LINEAR, wrap: twgl.CLAMP_TO_EDGE },
-	// { format: twgl.DEPTH_STENCIL, },
-  ];
-const fbi = twgl.createFramebufferInfo(gl, attachments);
+// Initial state of the input data. This "seeds" the
+// particle system for its first draw.
+let initialData = new Float32Array(COUNT * 6);
+for (let i = 0; i < COUNT * 6; i += 6) {
+    const px = Math.random() * 2 - 1;
+    const py = Math.random() * 2 - 1;
+    const vx = (Math.random() * 2 - 1) * 0.01;
+    const vy = (Math.random() * 2 - 1) * 0.01;
 
-gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-gl.useProgram(programInfo.program);
-twgl.setBuffersAndAttributes(gl, programInfo, bufferInfo);
-twgl.drawBufferInfo(gl, bufferInfo);
+    initialData.set([
+        px,                    // vAge
+        py,               // vLifespan
+        px, py,               // vPosition
+        vx,vy,                    // vVelocity
+    ], i);
 
-gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+console.log(initialData);
 
-let vertexShader2 = `
-	attribute vec2 position; 
-	uniform sampler2D u_texture;
-	void main() {
-		gl_Position = vec4(position, 0, 1);
-	}
-`;
+// Describe our first buffer for when it is used a vertex buffer
+const buffer1 = gl.createBuffer();
+const vao1 = gl.createVertexArray();
+gl.bindVertexArray(vao1);
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer1);
+gl.bufferData(gl.ARRAY_BUFFER, 6 * COUNT * 4, gl.DYNAMIC_COPY);
+gl.bufferSubData(gl.ARRAY_BUFFER, 0, initialData);
+gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 24, 0);
+gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 24, 4);
+gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 8);
+gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 24, 16);
+gl.enableVertexAttribArray(0);
+gl.enableVertexAttribArray(1);
+gl.enableVertexAttribArray(2);
+gl.enableVertexAttribArray(3);
 
-let fragmentShader2 = `
-	precision mediump float;
-	uniform sampler2D u_texture;
-	void main() {
-	  vec4 c = texture2D(u_texture, gl_FragCoord.xy / vec2(256.0, 256.0));
-	  gl_FragColor = vec4(c.r, c.g*0., c.b, 1.0);
-	}
-`;
+// Initial data is no longer needed, so we can clear it now.
+
+// Buffer2 is identical but does not need initial data
+const buffer2 = gl.createBuffer();
+const vao2 = gl.createVertexArray();
+gl.bindVertexArray(vao2);
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer2);
+gl.bufferData(gl.ARRAY_BUFFER, 6 * COUNT * 4, gl.DYNAMIC_COPY);
+gl.bufferSubData(gl.ARRAY_BUFFER, 0, initialData);
+gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 24, 0);
+gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 24, 4);
+gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 8);
+gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 24, 16);
+gl.enableVertexAttribArray(0);
+gl.enableVertexAttribArray(1);
+gl.enableVertexAttribArray(2);
+gl.enableVertexAttribArray(3);
+initialData = null;
+
+// Clean up after yourself
+gl.bindVertexArray(null);
+gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+// This code should NOT be used, since we are using a single
+// draw call to both UPDATE our particle system and DRAW it.
+// gl.enable(gl.RASTERIZER_DISCARD);
 
 
-// twgl setup with shaders
-const programInfoRender = twgl.createProgramInfo(gl, [vertexShader2, fragmentShader2]);
+// We have two VAOs and two buffers, but one of each is
+// ever active at a time. These variables will make sure
+// of that.
+let vao = vao1;
+let buffer = buffer1;
+let time = 0;
 
-bufferInfo = twgl.createBufferInfoFromArrays(gl, arrays);
+const uRandomLocation = gl.getUniformLocation(program, 'uRandom');
 
-const bufferInfoRender = twgl.createBufferInfoFromArrays(gl, arrays);
+// When we call `gl.clear(gl.COLOR_BUFFER_BIT)` WebGL will
+// use this color (100% black) as the background color.
+gl.clearColor(0,0,0,1);
 
-gl.useProgram(programInfoRender.program);
-twgl.setBuffersAndAttributes(gl, programInfoRender, bufferInfo);
-twgl.drawBufferInfo(gl, bufferInfo);
+const draw = () => {
+    // schedule the next draw call
+    requestAnimationFrame(draw);
 
+    // It often helps to send a single (or multiple) random
+    // numbers into the vertex shader as a uniform.
+    gl.uniform1f(uRandomLocation, Math.random());
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Bind one buffer to ARRAY_BUFFER and the other to TFB
+    gl.bindVertexArray(vao);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, buffer);
+
+    // Perform transform feedback and the draw call
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, COUNT);
+    gl.endTransformFeedback();
+
+    // Clean up after ourselves to avoid errors.
+    gl.bindVertexArray(null);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+
+    // If we HAD skipped the rasterizer, we would have turned it
+    // back on here too.
+    // gl.disable(gl.RASTERIZER_DISCARD);
+
+    // Swap the VAOs and buffers
+    if (vao === vao1) {
+        vao = vao2;
+        buffer = buffer1;
+    } else {
+        vao = vao1;
+        buffer = buffer2;
+    }
+};
+draw();
