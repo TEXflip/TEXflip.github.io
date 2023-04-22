@@ -10,46 +10,34 @@
     and saturate your bandwidth on most hardware.
 */
 
+
 const vertexShaderSource = `#version 300 es
 #pragma vscode_glsllint_stage: vert
 
-uniform float uRandom;
+uniform float uTime;
 
-layout(location=0) in float aAge;
-layout(location=1) in float aLifespan;
-layout(location=2) in vec2 aPosition;
-layout(location=3) in vec2 aVelocity;
+layout(location=0) in vec2 aTarget;
+layout(location=1) in vec2 aPosition;
+layout(location=2) in vec2 aVelocity;
 
-out float vAge;
-out float vLifespan;
+out vec2 vTarget;
 out vec2 vPosition;
 out vec2 vVelocity;
-out float vHealth;
-
-/* From TheBookOfShaders, chapter 10. This is a slightly upscaled implementation
- of the algorithm:
-    r = Math.cos(aReallyHugeNumber);
- except it attempts to avoid the concentration of values around 1 and 0 by 
- multiplying by a very large irrational number and then discarding the result's
- integer component. Acceptable results. Other deterministic pseudo-random number 
- algorithms are available (including random textures).
-*/
-float rand2(vec2 source)
-{
-    return fract(sin(dot(source.xy, vec2(1.9898,1.2313))) * 42758.5453123);
-} 
 
 void main()
 {
-	// Note that even values you **arn't** updating
-	// must be assigned to the varying or else the 
-	// value will be 0 in the next draw call.
-	vec2 gravity = vec2(0.0, 0.0);
+	vec2 p = aPosition + aVelocity;
 
-	vVelocity = aVelocity;
-	vPosition = aPosition + vVelocity;
-	vAge = min(aLifespan, aAge + .05);
-	vLifespan = aLifespan;
+    // this f*cking line is here to prevent the particles to disappearing when they are not moving
+    // beacuse some browsers renders only lines of points between 2 frames. 
+    // So technically speaking my particles are like electrons vibrating.
+    p += vec2(sin(uTime), cos(uTime)) * 0.000001;
+    vPosition = p;
+
+    vec2 targetDirection = normalize(aTarget - aPosition) * 0.1;
+    float speed = min(length(aVelocity), length(aTarget - aPosition));
+	vVelocity = normalize(aVelocity + targetDirection) * speed;
+    vTarget = aTarget;
 
 	if (vPosition.y < -1.0) {
 		vPosition.y = 1.0;
@@ -63,8 +51,6 @@ void main()
 	if (vPosition.x > 1.0) {
 		vPosition.x = -1.0;
 	}
-
-    vHealth = 1.0 - (vAge / vLifespan);
     
     gl_Position = vec4(vPosition, 0.0, 1.0);
     gl_PointSize = 4.0;
@@ -75,25 +61,15 @@ const fragmentShaderSource = `#version 300 es
 
 precision mediump float;
 
-in float vHealth;
-
 out vec4 fragColor;
 
 void main()
 {
-    // Point primitives are considered to have a width and
-    // height of 1 and the center is at (.5, .5). So if we
-    // discard fragments beyond this distance, we get a
-    // point primitive shaped like a disc.
-
-    float distanceFromPointCenter = distance(gl_PointCoord.xy, vec2(0.5));
-    if (distanceFromPointCenter > 0.5) discard;
-
-    fragColor = vec4(1., 1., 0., 1.);
+    fragColor = vec4(0., 0., 0., 1.);
 }`;
 
 const canvas = document.querySelector('canvas');
-const gl = canvas.getContext('webgl2');
+const gl = canvas.getContext('webgl2', {antialias: false});
 const program = gl.createProgram();
 
 const vertexShader = gl.createShader(gl.VERTEX_SHADER);
@@ -109,7 +85,7 @@ gl.attachShader(program, fragmentShader);
 // This line tells WebGL that these four output varyings should
 // be recorded by transform feedback and that we're using a single
 // buffer to record them.
-gl.transformFeedbackVaryings(program, ['vAge', 'vLifespan', 'vPosition', 'vVelocity'], gl.INTERLEAVED_ATTRIBS);
+gl.transformFeedbackVaryings(program, ['vTarget', 'vPosition', 'vVelocity'], gl.INTERLEAVED_ATTRIBS);
 
 gl.linkProgram(program);
 
@@ -122,7 +98,7 @@ if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
 gl.useProgram(program);
 
 // This is the number of primitives we will draw
-const COUNT = 100;
+const COUNT = 1000;
 
 // Initial state of the input data. This "seeds" the
 // particle system for its first draw.
@@ -130,18 +106,19 @@ let initialData = new Float32Array(COUNT * 6);
 for (let i = 0; i < COUNT * 6; i += 6) {
     const px = Math.random() * 2 - 1;
     const py = Math.random() * 2 - 1;
+    const tx = Math.random() * 2 - 1;
+    const ty = Math.random() * 2 - 1;
     const vx = (Math.random() * 2 - 1) * 0.01;
     const vy = (Math.random() * 2 - 1) * 0.01;
 
     initialData.set([
-        px,                    // vAge
-        py,               // vLifespan
-        px, py,               // vPosition
-        vx,vy,                    // vVelocity
+        tx, ty,     // vTarget
+        px, py,     // vPosition
+        vx, vy,     // vVelocity
     ], i);
 
 }
-console.log(initialData);
+// console.log(initialData);
 
 // Describe our first buffer for when it is used a vertex buffer
 const buffer1 = gl.createBuffer();
@@ -150,14 +127,12 @@ gl.bindVertexArray(vao1);
 gl.bindBuffer(gl.ARRAY_BUFFER, buffer1);
 gl.bufferData(gl.ARRAY_BUFFER, 6 * COUNT * 4, gl.DYNAMIC_COPY);
 gl.bufferSubData(gl.ARRAY_BUFFER, 0, initialData);
-gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 24, 0);
-gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 24, 4);
-gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 8);
-gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 24, 16);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0);
+gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 24, 8);
+gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 16);
 gl.enableVertexAttribArray(0);
 gl.enableVertexAttribArray(1);
 gl.enableVertexAttribArray(2);
-gl.enableVertexAttribArray(3);
 
 // Initial data is no longer needed, so we can clear it now.
 
@@ -168,14 +143,12 @@ gl.bindVertexArray(vao2);
 gl.bindBuffer(gl.ARRAY_BUFFER, buffer2);
 gl.bufferData(gl.ARRAY_BUFFER, 6 * COUNT * 4, gl.DYNAMIC_COPY);
 gl.bufferSubData(gl.ARRAY_BUFFER, 0, initialData);
-gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 24, 0);
-gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 24, 4);
-gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 8);
-gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 24, 16);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0);
+gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 24, 8);
+gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 24, 16);
 gl.enableVertexAttribArray(0);
 gl.enableVertexAttribArray(1);
 gl.enableVertexAttribArray(2);
-gl.enableVertexAttribArray(3);
 initialData = null;
 
 // Clean up after yourself
@@ -194,19 +167,20 @@ let vao = vao1;
 let buffer = buffer1;
 let time = 0;
 
-const uRandomLocation = gl.getUniformLocation(program, 'uRandom');
+const uTimeLocation = gl.getUniformLocation(program, 'uTime');
 
 // When we call `gl.clear(gl.COLOR_BUFFER_BIT)` WebGL will
 // use this color (100% black) as the background color.
-gl.clearColor(0,0,0,1);
+gl.clearColor(1,1,1,1);
 
 const draw = () => {
     // schedule the next draw call
     requestAnimationFrame(draw);
+    time +=1;
 
     // It often helps to send a single (or multiple) random
     // numbers into the vertex shader as a uniform.
-    gl.uniform1f(uRandomLocation, Math.random());
+    gl.uniform1f(uTimeLocation, time);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     // Bind one buffer to ARRAY_BUFFER and the other to TFB
