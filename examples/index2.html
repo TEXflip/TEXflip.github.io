@@ -3,7 +3,8 @@
 
 <head>
     <script>
-        function load_canvas(stream_settings) {
+        function load_canvas(camera, stream_settings) {
+            camera.play();
             let s_height = stream_settings.height;
             let s_width = stream_settings.width;
             // 512×512 Canvas with WebGL context
@@ -73,6 +74,9 @@
                 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, camera);
                 gl.drawArrays(gl.TRIANGLES, 0, 6);
                 requestAnimationFrame(animate);
+                if (camera.paused || camera.ended) {
+                    camera.play();
+                }
             }
             animate();
         }
@@ -95,9 +99,13 @@
                     }
                     let stream_settings = stream.getVideoTracks()[0].getSettings();
                     // console.log(stream_settings);
-                    load_canvas(stream_settings);
-                }, console.log);
-            camera.play();
+                    load_canvas(camera, stream_settings);
+                }).catch(
+                    (err) => {
+                        console.log(err);
+                        load_canvas(camera, { height: camera.videoHeight, width: camera.videoWidth });
+                    }
+                );
         }
     </script>
 </head>
@@ -105,7 +113,9 @@
 <body onload="javascript:main()">
     <canvas id='maincanvas'></canvas>
     <video id='camera' visible="False" style="display:none;" controls="true" playsinline="" crossorigin="anonymous"
-        muted="muted"></video>
+        muted="muted">
+        <source src="../assets/fingers.mov" type="video/mp4">
+    </video>
 </body>
 
 </html>
