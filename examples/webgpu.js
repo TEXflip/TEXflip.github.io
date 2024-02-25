@@ -1,6 +1,8 @@
 let camera = document.getElementById("camera")
 camera.addEventListener("load", main());
 
+NUM_POINTS = 1000;
+
 function main() {
     navigator.mediaDevices.getUserMedia({ video: 1, audio: 0 }).then(
         (stream) => {
@@ -50,8 +52,22 @@ async function load_canvas(camera, size) {
     console.log(height, width);
 
     const { device, canvas, context } = await setup_webgpu();
+
+    context.configure({
+        device: device,
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+    });
+
     canvas.width = width;
     canvas.height = height;
+
+    let points = [];
+    for (let i = 0; i < NUM_POINTS; i++) {
+        let x = parseInt(Math.random() * width);
+        let y = parseInt(Math.random() * height);
+        points.push([x, y]);
+    }
 
     const module = device.createShaderModule({
         label: 'voronoi',
@@ -62,9 +78,12 @@ async function load_canvas(camera, size) {
         
         @compute @workgroup_size(1) fn computeSomething(@builtin(global_invocation_id) id: vec3u) {
             let pixel = textureLoad(in_texture, id.xy);
-            let i = id.y * 320 + id.x;
-            let v = (pixel.x + pixel.y + pixel.z) / 3.0;
-            dataout[i] = u32(v * 255);
+            let i = id.y * 640 + id.x;
+            let v = u32(255 * (pixel.x + pixel.y + pixel.z) / 3.0);
+            let x = u32(255 * pixel.x);
+            let y = u32(255 * pixel.y);
+            let z = u32(255 * pixel.z);
+            dataout[i] = 0xff000000 | (z << 16) | (y << 8) | x;
         }
         `,
     });
@@ -77,26 +96,19 @@ async function load_canvas(camera, size) {
             entryPoint: 'computeSomething',
         },
     });
-    device.create
 
 
     // create a buffer on the GPU to hold our computation
     // input and output
-    // const readBuffer = device.createBuffer({
-    //     label: 'read buffer',
-    //     size: input.byteLength,
-    //     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    // });
-    const writeBuffer = device.createBuffer({
+    const points_buffer = device.createBuffer({
+        label: 'read buffer',
+        size: points.length * 4 * 2,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const write_buffer = device.createBuffer({
         label: 'write buffer',
         size: 4 * width * height,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-
-    const resultBuffer = device.createBuffer({
-        label: 'result buffer',
-        size: 4 * width * height,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
     });
 
     async function render_pass() {
@@ -104,62 +116,37 @@ async function load_canvas(camera, size) {
             source: camera
         });
 
-        const bindGroup = device.createBindGroup({
+        const bind_group = device.createBindGroup({
             label: 'bindGroup for work buffer',
             layout: pipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: frame_texture },
-                { binding: 1, resource: { buffer: writeBuffer } },
+                { binding: 1, resource: { buffer: write_buffer } },
             ],
         });
 
         const encoder = device.createCommandEncoder();
         const pass = encoder.beginComputePass();
         pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bindGroup);
+        pass.setBindGroup(0, bind_group);
         pass.dispatchWorkgroups(width, height);
         pass.end();
 
-        // Encode a command to copy the results to a mappable buffer.
-        encoder.copyBufferToBuffer(writeBuffer, 0, resultBuffer, 0, resultBuffer.size);
-        const rend_texture = device.createTexture({
-            size: { width: width, height: height, depthOrArrayLayers: 1 },
-            format: "r32uint",
-            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-        })
 
-        encoder.copyBufferToTexture({buffer: writeBuffer, bytesPerRow: 4 * width, rowsPerImage: height}, {texture: rend_texture}, {width, height, depthOrArrayLayers: 1 })
+        encoder.copyBufferToTexture(
+            { buffer: write_buffer, bytesPerRow: 4 * width, rowsPerImage: height },
+            { texture: context.getCurrentTexture() },
+            { width, height, depthOrArrayLayers: 1 }
+        )
 
-        const rend_pass = encoder.beginRenderPass({
-            colorAttachments: [{
-                view: context.getCurrentTexture().createView(),
-                loadOp: "clear",
-                clearValue: { r: 0, g: 1, b: 0, a: 1 },
-                storeOp: "store",
-            }]
-        });
-        rend_pass.end();
-
-        // Finish encoding and submit the commands
         const commandBuffer = encoder.finish();
 
         device.queue.submit([commandBuffer]);
 
-        // Read the results
-        await resultBuffer.mapAsync(GPUMapMode.READ);
-        const result = new Uint32Array(resultBuffer.getMappedRange());
-
-        console.log('result', Array.from(result));
-
-        // device.queue.writeBuffer(readBuffer, 0, result);
-
-        resultBuffer.unmap();
+        camera.requestVideoFrameCallback(render_pass);
     }
 
     camera.requestVideoFrameCallback(render_pass);
-    // Copy our input data to that buffer
-    // device.queue.copyExternalImageToTexture({source: camera}, { texture: texture} , [width, height, 3]);
-    // device.queue.writeBuffer(readBuffer, 0, input);
 
 
 }
