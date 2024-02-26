@@ -50,40 +50,139 @@ async function load_canvas(camera, size) {
     let height = size.height;
     let width = size.width;
     console.log(height, width);
-
     const { device, canvas, context } = await setup_webgpu();
-
     context.configure({
         device: device,
         format: "rgba8unorm",
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
     });
-
     canvas.width = width;
     canvas.height = height;
 
-    let points = [];
+    // prepare the points
+
+    let points_list = [];
     for (let i = 0; i < NUM_POINTS; i++) {
         let x = parseInt(Math.random() * width);
         let y = parseInt(Math.random() * height);
-        points.push([x, y]);
+        points_list.push([x, y]);
     }
+    points = new Float32Array(points_list.flat());
+
+    let weights = new Float32Array(points_list.length).fill(0);
+    let counts = new Uint32Array(points_list.length).fill(0);
+    let avg_weights = new Float32Array(points_list.length).fill(0);
+    let centroids = new Float32Array(2 * points_list.length).fill(0);
+
+    // create some buffers on the GPU to hold our computation
+
+    const points_buffer = device.createBuffer({
+        label: 'points_buffer',
+        size: points.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const centroids_buffer = device.createBuffer({
+        label: 'centroids_buffer',
+        size: centroids.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const weight_buffer = device.createBuffer({
+        label: 'weight_buffer',
+        size: centroids.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const count_buffer = device.createBuffer({
+        label: 'count_buffer',
+        size: centroids.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const avg_weight_buffer = device.createBuffer({
+        label: 'avg_weight_buffer',
+        size: centroids.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const result_centroids_buffer = device.createBuffer({
+        label: 'result_centroids_buffer',
+        size: centroids.byteLength,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    device.queue.writeBuffer(points_buffer, 0, points);
+    device.queue.writeBuffer(centroids_buffer, 0, centroids);
+    device.queue.writeBuffer(weight_buffer, 0, weights);
+    device.queue.writeBuffer(count_buffer, 0, counts);
+    device.queue.writeBuffer(avg_weight_buffer, 0, avg_weights);
 
     const module = device.createShaderModule({
         label: 'voronoi',
         code: /* wgsl */`
         @group(0) @binding(0) var in_texture: texture_external; // sRGB color space normalized
-        @group(0) @binding(1) var<storage, read_write> dataout: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> im_out: array<u32>;
+
+        @group(0) @binding(2) var<storage, read_write> points: array<vec2<f32>>;
+        @group(0) @binding(3) var<storage, read_write> centroids: array<vec2<f32>>;
+        @group(0) @binding(4) var<storage, read_write> weights: array<f32>;
+        @group(0) @binding(5) var<storage, read_write> counts: array<u32>;
+        @group(0) @binding(6) var<storage, read_write> avg_weights: array<f32>;
         // @group(0) @binding(1) var<storage, read> datain: array<f32>;
         
-        @compute @workgroup_size(1) fn computeSomething(@builtin(global_invocation_id) id: vec3u) {
+        @compute @workgroup_size(1) fn centorid_computation(@builtin(global_invocation_id) id: vec3u) {
             let pixel = textureLoad(in_texture, id.xy);
             let i = id.y * 640 + id.x;
-            let v = u32(255 * (pixel.x + pixel.y + pixel.z) / 3.0);
+            var min_dist = 1000000.0;
+            var min_index = 0u;
+
+            if (i < 1000) {
+                centroids[i] = vec2<f32>(0.0, 0.0);
+                weights[i] = 0.0;
+                counts[i] = 0u;
+                avg_weights[i] = 0.0;
+            }
+
+            workgroupBarrier();
+
+            for (var j = 0u; j < 1000; j++) {
+                let dist = distance(points[j], vec2<f32>(f32(id.x),f32(id.y)));
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    min_index = j;
+                }
+            }
+
+            let weight = 1 - ((pixel.x + pixel.y + pixel.z) / 3.0);
             let x = u32(255 * pixel.x);
             let y = u32(255 * pixel.y);
             let z = u32(255 * pixel.z);
-            dataout[i] = 0xff000000 | (z << 16) | (y << 8) | x;
+
+            centroids[min_index].x += f32(id.x) * weight;
+            centroids[min_index].y += f32(id.y) * weight;
+            weights[min_index] += weight;
+            counts[min_index]++;
+
+            workgroupBarrier();
+            
+            if (i < 1000) {
+                if (weights[i] > 0) {
+                    centroids[i] = centroids[i] / weights[i];
+                    avg_weights[i] = weights[i] / max(f32(counts[i]), 1);
+                } else {
+                    centroids[i] = vec2<f32>(points[i].x, points[i].y);
+                }
+                points[i] = centroids[i];
+            }
+            workgroupBarrier();
+            // let v = points[i];
+            let sw = avg_weights[i] * 120.0;
+            // let sw = map(avgWeights[i], 0, maxWeight, 0, 12, true);
+            // strokeWeight(sw);
+            // point(v.x, v.y);
+            if (min_dist < 2) {
+                im_out[i] = 0xff000000;
+            }
+            else {
+                im_out[i] = 0xff000000 | (z << 16) | (y << 8) | x;
+            }
+
         }
         `,
     });
@@ -93,18 +192,13 @@ async function load_canvas(camera, size) {
         layout: 'auto',
         compute: {
             module,
-            entryPoint: 'computeSomething',
+            entryPoint: 'centorid_computation',
         },
     });
 
 
     // create a buffer on the GPU to hold our computation
     // input and output
-    const points_buffer = device.createBuffer({
-        label: 'read buffer',
-        size: points.length * 4 * 2,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
     const write_buffer = device.createBuffer({
         label: 'write buffer',
         size: 4 * width * height,
@@ -122,6 +216,11 @@ async function load_canvas(camera, size) {
             entries: [
                 { binding: 0, resource: frame_texture },
                 { binding: 1, resource: { buffer: write_buffer } },
+                { binding: 2, resource: { buffer: points_buffer } },
+                { binding: 3, resource: { buffer: centroids_buffer } },
+                { binding: 4, resource: { buffer: weight_buffer } },
+                { binding: 5, resource: { buffer: count_buffer } },
+                { binding: 6, resource: { buffer: avg_weight_buffer } },
             ],
         });
 
@@ -139,9 +238,17 @@ async function load_canvas(camera, size) {
             { width, height, depthOrArrayLayers: 1 }
         )
 
+        encoder.copyBufferToBuffer(centroids_buffer, 0, result_centroids_buffer, 0, centroids.byteLength);
         const commandBuffer = encoder.finish();
 
         device.queue.submit([commandBuffer]);
+
+        // await result_centroids_buffer.mapAsync(GPUMapMode.READ);
+        // const result_centroids = new Float32Array(result_centroids_buffer.getMappedRange());
+
+        // console.log(Array.from(result_centroids));
+
+        // result_centroids_buffer.unmap();
 
         camera.requestVideoFrameCallback(render_pass);
     }
