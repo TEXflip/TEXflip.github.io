@@ -78,11 +78,11 @@ async function load_canvas(camera, size) {
     let width = size.width;
     console.log(height, width);
     const { device, canvas, context } = await setup_webgpu();
-    context.configure({
-        device: device,
-        format: "rgba8unorm",
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-    });
+    // context.configure({
+    //     device: device,
+    //     format: "rgba8unorm",
+    //     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+    // });
     canvas.width = width;
     canvas.height = height;
 
@@ -101,9 +101,7 @@ async function load_canvas(camera, size) {
     let weights = new Uint32Array(NUM_POINTS).fill(0);
     let counts = new Uint32Array(NUM_POINTS).fill(0);
     let avg_weights = new Float32Array(NUM_POINTS).fill(0);
-    let centroids_x = new Uint32Array(NUM_POINTS).fill(0);
-    let centroids_y = new Uint32Array(NUM_POINTS).fill(0);
-    let locks = new Uint32Array(NUM_POINTS).fill(0);
+    let centroids = new Uint32Array(2 * NUM_POINTS).fill(0);
 
     // create some buffers on the GPU to hold our computation
 
@@ -112,14 +110,9 @@ async function load_canvas(camera, size) {
         size: points.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    const centroids_x_buffer = device.createBuffer({
-        label: 'centroids_x_buffer',
-        size: centroids_x.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-    });
-    const centroids_y_buffer = device.createBuffer({
-        label: 'centroids_y_buffer',
-        size: centroids_y.byteLength,
+    const centroids_buffer = device.createBuffer({
+        label: 'centroids_buffer',
+        size: centroids.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     const weight_buffer = device.createBuffer({
@@ -137,32 +130,19 @@ async function load_canvas(camera, size) {
         size: avg_weights.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-
-    // RESULT BUFFERS
-    const result_weight_buffer = device.createBuffer({
-        label: 'result_weight_buffer',
-        size: weights.byteLength,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    const weightmax_buffer = device.createBuffer({
+        label: 'weightmax_buffer',
+        size: 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    const result_count_buffer = device.createBuffer({
-        label: 'result_count_buffer',
-        size: counts.byteLength,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const result_centroid_x_buffer = device.createBuffer({
-        label: 'result_centroid_x_buffer',
-        size: centroids_x.byteLength,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const result_centroid_y_buffer = device.createBuffer({
-        label: 'result_centroid_y_buffer',
-        size: centroids_y.byteLength,
+    const res_weightmax_buffer = device.createBuffer({
+        label: 'weightmax_buffer',
+        size: 4,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
 
     device.queue.writeBuffer(points_buffer, 0, points);
-    device.queue.writeBuffer(centroids_x_buffer, 0, centroids_x);
-    device.queue.writeBuffer(centroids_y_buffer, 0, centroids_y);
+    device.queue.writeBuffer(centroids_buffer, 0, centroids);
     device.queue.writeBuffer(weight_buffer, 0, weights);
     device.queue.writeBuffer(count_buffer, 0, counts);
     device.queue.writeBuffer(avg_weight_buffer, 0, avg_weights);
@@ -171,62 +151,35 @@ async function load_canvas(camera, size) {
         label: 'voronoi',
         code: /* wgsl */`
 
+        struct ConstDataStruct {
+            N_POINTS: u32,
+            WIDTH: u32,
+            HEIGHT: u32,
+        };
+
         const NUM_POINTS = 1000u;
         const WIDTH = 640u;
         const HEIGHT = 480u;
         const FLOAT_MULT_PREC = 1000.0;
-        
-        struct Locks {
-            locks: array<atomic<u32>, 1000>,
-        };
-
-        @group(0) @binding(7) var<storage, read_write> locks: Locks;
-
-        fn lock(location: u32) -> bool {
-            let lock_ptr = &locks.locks[location];
-            let original_lock_value = atomicLoad(lock_ptr);
-            if (original_lock_value > 0u) {
-                return false;
-            }
-            return atomicAdd(lock_ptr, 1u) == original_lock_value;
-        }
-        
-        fn unlock(location: u32) {
-            atomicStore(&locks.locks[location], 0u);
-        }
 
         @group(0) @binding(0) var in_texture: texture_external; // sRGB color space normalized
-        @group(0) @binding(1) var<storage, read_write> im_out: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> idx_map: array<u32>;
         
         @group(0) @binding(2) var<storage, read_write> points: array<vec2<f32>>;
-        @group(0) @binding(3) var<storage, read_write> centroids_x: array<atomic<u32>>;
-        @group(0) @binding(4) var<storage, read_write> centroids_y: array<atomic<u32>>;
+        @group(0) @binding(3) var<storage, read_write> centroids: array<atomic<u32>>;
         @group(0) @binding(5) var<storage, read_write> weights: array<atomic<u32>>;
         @group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>>;
-        // @group(0) @binding(1) var<storage, read> datain: array<f32>;
-        
-        fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
-            let K = vec4<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-            let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-            return c.z * mix(K.xxx, clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0f)), c.y);
-        }
-        
-        fn vec3_to_u32(v: vec3<f32>) -> u32 {
-            let r = u32(255 * v.x);
-            let g = u32(255 * v.y);
-            let b = u32(255 * v.z);
-            return 0xff000000 | (b << 16) | (g << 8) | r;
-        }
+        @group(0) @binding(7) var<uniform> constData: ConstDataStruct;
         
         @compute @workgroup_size(1,1,1) fn centorid_computation(@builtin(global_invocation_id) id: vec3u) {
             let pixel = textureLoad(in_texture, id.xy);
-            let i = u32(id.y * WIDTH + id.x);
+            let i = id.y * WIDTH + id.x;
             var min_dist = 1000000.0;
             var min_index = 0u;
 
-            if (i < 1000) {
-                atomicStore(&centroids_x[i], 0u);
-                atomicStore(&centroids_y[i], 0u);
+            if (i < NUM_POINTS) {
+                atomicStore(&centroids[2 * i], 0u);
+                atomicStore(&centroids[2 * i + 1], 0u);
                 atomicStore(&weights[i], 0u);
                 atomicStore(&counts[i], 0u);
             }
@@ -238,30 +191,15 @@ async function load_canvas(camera, size) {
                     min_index = j;
                 }
             }
+            idx_map[i] = min_index;
 
-            let weight_f = 1 - (pixel.x + pixel.y + pixel.z) / 3.0;
-            let weight = u32(255 - 85 * (pixel.x + pixel.y + pixel.z));
+            let weight = u32(85 * (pixel.x + pixel.y + pixel.z));
+            let weight_f = f32(weight) / 256.0;
 
-            atomicAdd(&centroids_x[min_index], u32(round(f32(id.x) * weight_f * FLOAT_MULT_PREC)));
-            atomicAdd(&centroids_y[min_index], u32(round(f32(id.y) * weight_f * FLOAT_MULT_PREC)));
+            atomicAdd(&centroids[2 * min_index], u32(round(f32(id.x) * weight_f * FLOAT_MULT_PREC)));
+            atomicAdd(&centroids[2 * min_index + 1], u32(round(f32(id.y) * weight_f * FLOAT_MULT_PREC)));
             atomicAdd(&weights[min_index], weight);
             atomicAdd(&counts[min_index], 1u);
-
-            // if (i < 1000) {
-                // if (weights[i] > 0) {
-                //     centroids[i] = centroids[i] / weights[i];
-                //     avg_weights[i] = weights[i] / max(f32(counts[i]), 1);
-                // } else {
-                //     centroids[i] = vec2<f32>(points[i]);
-                // }
-                // centroids[i].x = points[i].x;
-                // centroids[i].y = points[i].y;
-                // points[i] = vec2<f32>(centroids[i].x, centroids[i].y);
-            // }
-
-            // let sw = avg_weights[i] * 120.0;
-            let i_col = hsv2rgb(vec3<f32>(f32(min_index) / (1000), 1.0, 1.0));
-            im_out[i] = vec3_to_u32(i_col);
         }
         `,
     });
@@ -269,21 +207,82 @@ async function load_canvas(camera, size) {
     const module2 = device.createShaderModule({
         label: 'voronoi 2',
         code: /* wgsl */`
-        @group(0) @binding(0) var<storage, read_write> im_out: array<u32>;
-        @group(0) @binding(1) var<storage, read_write> centroids_x: array<atomic<u32>>;
-        @group(0) @binding(2) var<storage, read_write> centroids_y: array<atomic<u32>>;
-        @group(0) @binding(4) var<storage, read_write> weights: array<u32>;
-        @group(0) @binding(5) var<storage, read_write> counts: array<u32>;
-        @compute @workgroup_size(1,1,1) fn centorid_computation2(@builtin(global_invocation_id) id: vec3u) {
-            let i = u32(id.y * 640 + id.x);
-            let c = counts[i];
-            im_out[i] = weights[id.x];
+        const FLOAT_MULT_PREC = 1000.0;
+        
+        @group(0) @binding(0) var<storage, read_write> points: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> centroids: array<u32>;
+        @group(0) @binding(2) var<storage, read_write> weights: array<u32>;
+        @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> avg_weights: array<u32>;
+        @group(0) @binding(5) var<storage, read_write> wheight_max: atomic<u32>;
+        @compute @workgroup_size(1) fn points_update(@builtin(global_invocation_id) id: vec3u) {
+            let i = id.x;
+            var c_x = f32(centroids[2*i]) / FLOAT_MULT_PREC;
+            var c_y = f32(centroids[2*i+1]) / FLOAT_MULT_PREC;
+            if (weights[i] > 0) {
+                let weight = f32(weights[i]) / 256.0;
+                c_x /= weight;
+                c_y /= weight;
+                avg_weights[i] = weights[i] / max(counts[i], 1u);
+                atomicMax(&wheight_max, avg_weights[i]);
+            }
+            points[i].x = c_x;
+            points[i].y = c_y;
+        }
+        `,
+    });
+
+    const rend_module = device.createShaderModule({
+        label: 'render module',
+        code:  /* wgsl */`
+        struct ConstDataStruct {
+            N_POINTS: u32,
+            WIDTH: u32,
+            HEIGHT: u32,
+        };
+
+        const pos : array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, 1.0),
+            vec2<f32>(-1.0, -1.0),
+            vec2<f32>(1.0, 1.0),
+            vec2<f32>(-1.0, -1.0),
+            vec2<f32>(1.0, 1.0),
+            vec2<f32>(1.0, -1.0)
+        );
+
+        @vertex fn vs(@builtin(vertex_index) vertexIndex : u32) -> @builtin(position) vec4f {  
+            return vec4f(pos[vertexIndex], 0.0, 0.0);
+        }
+        
+        @group(0) @binding(0) var<storage, read> points: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read> avg_weights: array<u32>;
+        @group(0) @binding(2) var<storage, read> weight_max: u32;
+        @group(0) @binding(3) var<storage, read_write> idx_map: array<u32>;
+        @group(0) @binding(4) var<uniform> constData: ConstDataStruct;
+        @fragment fn fs(@builtin(position) coord_in: vec4<f32>) -> @location(0) vec4f {
+            let res = vec2<f32>(640.0, 480.0);
+            var col = vec3f(0.0, 0.0, 0.0);
+            let c = coord_in.xy - vec2f(0.5, 0.5);
+            let p_idx = idx_map[u32(c.y * 640.0 + c.x)];
+            let weight = f32(avg_weights[p_idx]) / 256.0;
+            let point = points[p_idx];
+
+            let dist = distance(point, coord_in.xy);
+
+            let th = 1200 * weight / f32(weight_max);
+            if (dist < th) {
+                col = vec3f(1.0, 1.0, 1.0);
+            }
+            // let idx_f32 = f32(p_idx) / 1000.0;
+            // col = vec3f(idx_f32, idx_f32, idx_f32);
+
+            return vec4f(col, 1);
         }
         `,
     });
 
     const pipeline = device.createComputePipeline({
-        label: 'doubling compute pipeline',
+        label: 'centorid_computation',
         layout: 'auto',
         compute: {
             module: module,
@@ -292,121 +291,143 @@ async function load_canvas(camera, size) {
     });
 
     const pipeline2 = device.createComputePipeline({
-        label: 'centroid 2',
+        label: 'points update',
         layout: 'auto',
         compute: {
             module: module2,
-            entryPoint: 'centorid_computation2',
+            entryPoint: 'points_update',
+        },
+    });
+
+    const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device,
+        format: presentationFormat,
+    });
+
+    const rend_pipeline = device.createRenderPipeline({
+        label: 'our hardcoded red triangle pipeline',
+        layout: 'auto',
+        vertex: {
+            module: rend_module,
+            entryPoint: 'vs',
+        },
+        fragment: {
+            module: rend_module,
+            entryPoint: 'fs',
+            targets: [{ format: presentationFormat }],
         },
     });
 
 
     // create a buffer on the GPU to hold our computation
     // input and output
-    const write_buffer = device.createBuffer({
-        label: 'write buffer',
+    const index_buffer = device.createBuffer({
+        label: 'index buffer',
         size: 4 * width * height,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
+
+    const renderPassDescriptor = {
+        label: 'our basic canvas renderPass',
+        colorAttachments: [
+            {
+                // view: <- to be filled out when we render
+                clearValue: [0.3, 0.3, 0.3, 1],
+                loadOp: 'clear',
+                storeOp: 'store',
+            },
+        ],
+    };
+
+    const comp1_bind_group_desc = {
+        label: 'bindGroup 0',
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: undefined },
+            { binding: 1, resource: { buffer: index_buffer } },
+            { binding: 2, resource: { buffer: points_buffer } },
+            { binding: 3, resource: { buffer: centroids_buffer } },
+            { binding: 5, resource: { buffer: weight_buffer } },
+            { binding: 6, resource: { buffer: count_buffer } },
+            // { binding: 7, resource: { buffer: locks_buffer } },
+        ],
+    }
+
+    const comp2_bind_group_desc = {
+        label: 'bindGroup 1',
+        layout: pipeline2.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: points_buffer } },
+            { binding: 1, resource: { buffer: centroids_buffer } },
+            { binding: 2, resource: { buffer: weight_buffer } },
+            { binding: 3, resource: { buffer: count_buffer } },
+            { binding: 4, resource: { buffer: avg_weight_buffer } },
+            { binding: 5, resource: { buffer: weightmax_buffer } },
+        ],
+    }
+
+    const rend_boind_group_desc = {
+        label: 'bindGroup 2',
+        layout: rend_pipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: points_buffer } },
+            { binding: 1, resource: { buffer: avg_weight_buffer } },
+            { binding: 2, resource: { buffer: weightmax_buffer } },
+            { binding: 3, resource: { buffer: index_buffer } },
+        ],
+    }
 
     async function render_pass() {
         frame_texture = device.importExternalTexture({
             source: camera
         });
 
-        const bind_group = device.createBindGroup({
-            label: 'bindGroup 0',
-            layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: frame_texture },
-                { binding: 1, resource: { buffer: write_buffer } },
-                { binding: 2, resource: { buffer: points_buffer } },
-                { binding: 3, resource: { buffer: centroids_x_buffer } },
-                { binding: 4, resource: { buffer: centroids_y_buffer } },
-                { binding: 5, resource: { buffer: weight_buffer } },
-                { binding: 6, resource: { buffer: count_buffer } },
-                // { binding: 7, resource: { buffer: locks_buffer } },
-            ],
-        });
-
-        // const bind_group2 = device.createBindGroup({
-        //     label: 'bindGroup 1',
-        //     layout: pipeline2.getBindGroupLayout(0),
-        //     entries: [
-        //         { binding: 0, resource: { buffer: write_buffer } },
-        //         { binding: 4, resource: { buffer: weight_buffer } },
-        //         { binding: 5, resource: { buffer: count_buffer } },
-        //     ],
-        // });
-        // device.queue.writeBuffer(centroids_buffer, 0, centroids);   
-
+        comp1_bind_group_desc.entries[0].resource = frame_texture;
 
         const encoder = device.createCommandEncoder();
-        // encoder.clearBuffer(centroids_buffer);
+
         const pass = encoder.beginComputePass();
         pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bind_group);
+        pass.setBindGroup(0, device.createBindGroup(comp1_bind_group_desc));
         pass.dispatchWorkgroups(width, height);
         pass.end();
 
-        // const pass2 = encoder.beginComputePass();
-        // pass2.setPipeline(pipeline2);
-        // pass2.setBindGroup(0, bind_group2);
-        // pass2.dispatchWorkgroups(width, height);
-        // pass2.end();
+        encoder.clearBuffer(weightmax_buffer)
 
-        encoder.copyBufferToTexture(
-            { buffer: write_buffer, bytesPerRow: 4 * width, rowsPerImage: height },
-            { texture: context.getCurrentTexture() },
-            { width, height, depthOrArrayLayers: 1 }
-        )
+        const pass2 = encoder.beginComputePass();
+        pass2.setPipeline(pipeline2);
+        pass2.setBindGroup(0, device.createBindGroup(comp2_bind_group_desc));
+        pass2.dispatchWorkgroups(NUM_POINTS);
+        pass2.end();
 
-        encoder.copyBufferToBuffer(weight_buffer, 0, result_weight_buffer, 0, weights.byteLength);
-        encoder.copyBufferToBuffer(count_buffer, 0, result_count_buffer, 0, counts.byteLength);
-        encoder.copyBufferToBuffer(centroids_x_buffer, 0, result_centroid_x_buffer, 0, centroids_x.byteLength);
-        encoder.copyBufferToBuffer(centroids_y_buffer, 0, result_centroid_y_buffer, 0, centroids_y.byteLength);
+        encoder.copyBufferToBuffer(weightmax_buffer, 0, res_weightmax_buffer, 0, 4);
+
+        renderPassDescriptor.colorAttachments[0].view =
+            context.getCurrentTexture().createView();
+
+        const pass3 = encoder.beginRenderPass(renderPassDescriptor);
+        pass3.setPipeline(rend_pipeline);
+        pass3.setBindGroup(0, device.createBindGroup(rend_boind_group_desc));
+        pass3.draw(6);  // call our vertex shader 3 times
+        pass3.end();
 
         device.queue.submit([encoder.finish()]);
 
-        await result_weight_buffer.mapAsync(GPUMapMode.READ);
-        await result_count_buffer.mapAsync(GPUMapMode.READ);
-        await result_centroid_x_buffer.mapAsync(GPUMapMode.READ);
-        await result_centroid_y_buffer.mapAsync(GPUMapMode.READ);
+        await res_weightmax_buffer.mapAsync(GPUMapMode.READ);
+        const res_weightmax = new Uint32Array(res_weightmax_buffer.getMappedRange());
 
-        const result_weights = new Uint32Array(result_weight_buffer.getMappedRange());
-        const result_counts = new Uint32Array(result_count_buffer.getMappedRange());
-        const result_centroids_x = new Uint32Array(result_centroid_x_buffer.getMappedRange());
-        const result_centroids_y = new Uint32Array(result_centroid_y_buffer.getMappedRange());
+        // console.log(res_weightmax[0]);
 
-        let max_weight = 0;
-        for (let i = 0; i < NUM_POINTS; i++) {
-            let c_x = result_centroids_x[i] / 1000;
-            let c_y = result_centroids_y[i] / 1000;
-            if (result_weights[i] > 0) {
-                let weight = result_weights[i] / 255;
-                c_x /= weight;
-                c_y /= weight;
-                avg_weights[i] = weight / (result_counts[i] || 1);
-                if (avg_weights[i] > max_weight) {
-                    max_weight = avg_weights[i];
-                }
-            }
-            points[2 * i] = c_x;
-            points[2 * i + 1] = c_y;
-        }
-
-        device.queue.writeBuffer(points_buffer, 0, points);
-
-        // console.log(points);
-
-        result_weight_buffer.unmap();
-        result_count_buffer.unmap();
-        result_centroid_x_buffer.unmap();
-        result_centroid_y_buffer.unmap();
+        res_weightmax_buffer.unmap();
 
         camera.requestVideoFrameCallback(render_pass);
+        // let time = performance.now();
+        // console.log("FPS: ", 1000 / (time - last_time));
+        // last_time = time;
     }
 
+    let last_time = performance.now();
     camera.requestVideoFrameCallback(render_pass);
 
     document.addEventListener("keydown", function (event) {
