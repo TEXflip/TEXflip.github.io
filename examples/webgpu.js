@@ -1,7 +1,7 @@
 let camera = document.getElementById("camera")
 camera.addEventListener("load", main());
 
-NUM_POINTS = 1000;
+NUM_POINTS = 3000;
 
 function cyrb128(str) {
     let h1 = 1779033703, h2 = 3144134277,
@@ -140,12 +140,18 @@ async function load_canvas(camera, size) {
         size: 4,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
+    const consts_buffer = device.createBuffer({
+        size: 3 * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const constants = new Uint32Array(3);
 
     device.queue.writeBuffer(points_buffer, 0, points);
     device.queue.writeBuffer(centroids_buffer, 0, centroids);
     device.queue.writeBuffer(weight_buffer, 0, weights);
     device.queue.writeBuffer(count_buffer, 0, counts);
     device.queue.writeBuffer(avg_weight_buffer, 0, avg_weights);
+    device.queue.writeBuffer(consts_buffer, 0, new Uint32Array([NUM_POINTS, width, height]));
 
     const module = device.createShaderModule({
         label: 'voronoi',
@@ -173,18 +179,18 @@ async function load_canvas(camera, size) {
         
         @compute @workgroup_size(1,1,1) fn centorid_computation(@builtin(global_invocation_id) id: vec3u) {
             let pixel = textureLoad(in_texture, id.xy);
-            let i = id.y * WIDTH + id.x;
+            let i = id.y * constData.WIDTH + id.x;
             var min_dist = 1000000.0;
             var min_index = 0u;
 
-            if (i < NUM_POINTS) {
+            if (i < constData.N_POINTS) {
                 atomicStore(&centroids[2 * i], 0u);
                 atomicStore(&centroids[2 * i + 1], 0u);
                 atomicStore(&weights[i], 0u);
                 atomicStore(&counts[i], 0u);
             }
 
-            for (var j = 0u; j < NUM_POINTS; j++) {
+            for (var j = 0u; j < constData.N_POINTS; j++) {
                 let dist = distance(points[j], vec2<f32>(f32(id.x), f32(id.y)));
                 if (dist < min_dist) {
                     min_dist = dist;
@@ -214,7 +220,7 @@ async function load_canvas(camera, size) {
         @group(0) @binding(2) var<storage, read_write> weights: array<u32>;
         @group(0) @binding(3) var<storage, read_write> counts: array<u32>;
         @group(0) @binding(4) var<storage, read_write> avg_weights: array<u32>;
-        @group(0) @binding(5) var<storage, read_write> wheight_max: atomic<u32>;
+        @group(0) @binding(5) var<storage, read_write> weight_max: atomic<u32>;
         @compute @workgroup_size(1) fn points_update(@builtin(global_invocation_id) id: vec3u) {
             let i = id.x;
             var c_x = f32(centroids[2*i]) / FLOAT_MULT_PREC;
@@ -224,7 +230,7 @@ async function load_canvas(camera, size) {
                 c_x /= weight;
                 c_y /= weight;
                 avg_weights[i] = weights[i] / max(counts[i], 1u);
-                atomicMax(&wheight_max, avg_weights[i]);
+                atomicMax(&weight_max, avg_weights[i]);
             }
             points[i].x = c_x;
             points[i].y = c_y;
@@ -260,18 +266,19 @@ async function load_canvas(camera, size) {
         @group(0) @binding(3) var<storage, read_write> idx_map: array<u32>;
         @group(0) @binding(4) var<uniform> constData: ConstDataStruct;
         @fragment fn fs(@builtin(position) coord_in: vec4<f32>) -> @location(0) vec4f {
-            let res = vec2<f32>(640.0, 480.0);
             var col = vec3f(0.0, 0.0, 0.0);
             let c = coord_in.xy - vec2f(0.5, 0.5);
-            let p_idx = idx_map[u32(c.y * 640.0 + c.x)];
+            let p_idx = idx_map[u32(c.y * f32(constData.WIDTH) + c.x)];
             let weight = f32(avg_weights[p_idx]) / 256.0;
             let point = points[p_idx];
 
             let dist = distance(point, coord_in.xy);
 
-            let th = 1200 * weight / f32(weight_max);
+            let th = 800 * weight / f32(weight_max);
             if (dist < th) {
-                col = vec3f(1.0, 1.0, 1.0);
+                var c_d = dist / th;
+                c_d = 1.0 - c_d*c_d*c_d;
+                col = vec3f(c_d, c_d, c_d);
             }
             // let idx_f32 = f32(p_idx) / 1000.0;
             // col = vec3f(idx_f32, idx_f32, idx_f32);
@@ -350,7 +357,7 @@ async function load_canvas(camera, size) {
             { binding: 3, resource: { buffer: centroids_buffer } },
             { binding: 5, resource: { buffer: weight_buffer } },
             { binding: 6, resource: { buffer: count_buffer } },
-            // { binding: 7, resource: { buffer: locks_buffer } },
+            { binding: 7, resource: { buffer: consts_buffer } },
         ],
     }
 
@@ -375,6 +382,7 @@ async function load_canvas(camera, size) {
             { binding: 1, resource: { buffer: avg_weight_buffer } },
             { binding: 2, resource: { buffer: weightmax_buffer } },
             { binding: 3, resource: { buffer: index_buffer } },
+            { binding: 4, resource: { buffer: consts_buffer } },
         ],
     }
 
@@ -414,16 +422,9 @@ async function load_canvas(camera, size) {
 
         device.queue.submit([encoder.finish()]);
 
-        await res_weightmax_buffer.mapAsync(GPUMapMode.READ);
-        const res_weightmax = new Uint32Array(res_weightmax_buffer.getMappedRange());
-
-        // console.log(res_weightmax[0]);
-
-        res_weightmax_buffer.unmap();
-
         camera.requestVideoFrameCallback(render_pass);
         // let time = performance.now();
-        // console.log("FPS: ", 1000 / (time - last_time));
+        // console.log("FPS = ", 1000 / (time - last_time));
         // last_time = time;
     }
 
